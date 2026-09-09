@@ -1,0 +1,368 @@
+`timescale 1ns/1ps
+
+module cnn_accelerator_tb;
+    localparam int IMAGE_WIDTH  = 32;
+    localparam int IMAGE_HEIGHT = 32;
+    localparam int KERNEL_SIZE = 3;
+    localparam int OUTPUT_WIDTH = IMAGE_WIDTH - KERNEL_SIZE + 1;
+    localparam int OUTPUT_HEIGHT = IMAGE_HEIGHT - KERNEL_SIZE + 1;
+    localparam int TOTAL_INPUT_PIXELS = IMAGE_WIDTH * IMAGE_HEIGHT;
+    localparam int TOTAL_OUTPUT_PIXELS = OUTPUT_WIDTH * OUTPUT_HEIGHT;
+    logic clk;
+    logic rst_n;
+    logic start;
+    logic busy;
+    logic done;
+    logic       pixel_valid;
+    logic [7:0] pixel_in;
+    logic              kernel_we;
+    logic [3:0]        kernel_addr;
+    logic signed [7:0] kernel_data;
+    logic relu_enable;
+    logic               output_valid;
+    logic signed [15:0] pixel_out;
+    logic [$clog2(IMAGE_WIDTH)-1:0]  output_col;
+    logic [$clog2(IMAGE_HEIGHT)-1:0] output_row;
+    logic [7:0] image [0:TOTAL_INPUT_PIXELS-1];
+    logic signed [7:0] test_kernel [0:8];
+    logic signed [15:0] expected_output [0:TOTAL_OUTPUT_PIXELS-1];
+    integer errors;
+    integer output_count;
+    integer expected_row;
+    integer expected_col;
+    integer current_cycle;
+    integer last_output_cycle;
+    cnn_accelerator #(
+        .IMAGE_WIDTH  (IMAGE_WIDTH),
+        .IMAGE_HEIGHT (IMAGE_HEIGHT)
+    ) dut (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start(start),
+        .busy(busy),
+        .done(done),
+        .pixel_valid(pixel_valid),
+        .pixel_in(pixel_in),
+        .kernel_we(kernel_we),
+        .kernel_addr(kernel_addr),
+        .kernel_data(kernel_data),
+        .relu_enable(relu_enable),
+        .output_valid(output_valid),
+        .pixel_out(pixel_out),
+        .output_col(output_col),
+        .output_row(output_row)
+    );
+    initial begin
+        clk = 1'b0;
+        forever #5 clk = ~clk;
+    end
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            current_cycle <= 0;
+        else
+            current_cycle <= current_cycle + 1;
+    end
+    initial begin
+        errors = 0;
+        output_count = 0;
+        expected_row = 0;
+        expected_col = 0;
+        current_cycle = 0;
+        last_output_cycle = -1;
+    end
+    task automatic reset_dut;
+        begin
+            rst_n = 1'b0;
+            start = 1'b0;
+            pixel_valid = 1'b0;
+            pixel_in = 8'd0;
+            kernel_we = 1'b0;
+            kernel_addr = 4'd0;
+            kernel_data = 8'sd0;
+            relu_enable = 1'b0;
+            repeat (5) @(negedge clk);
+            rst_n = 1'b1;
+            repeat (2) @(negedge clk);
+            $display("");
+            $display("========================================");
+            $display("RESET COMPLETE");
+            $display("========================================");
+        end
+    endtask
+
+    task automatic write_kernel(
+        input integer address,
+        input integer value
+    );
+        begin
+            @(negedge clk);
+            kernel_we   = 1'b1;
+            kernel_addr = address;
+            kernel_data = value;
+
+            @(negedge clk);
+            kernel_we   = 1'b0;
+            kernel_addr = 4'd0;
+            kernel_data = 8'sd0;
+
+        end
+
+    endtask
+
+    task automatic program_kernel;
+        begin
+            $display("");
+            $display("Programming kernel...");
+            for (int i = 0; i < 9; i++) begin
+                write_kernel(
+                    i,
+                    test_kernel[i]
+                );
+            end
+            $display("Kernel programmed.");
+        end
+
+    endtask
+
+    task automatic generate_image;
+        begin
+            for (int row = 0; row < IMAGE_HEIGHT; row++) begin
+                for (int col = 0; col < IMAGE_WIDTH; col++) begin
+                    image[row * IMAGE_WIDTH + col] = (row * IMAGE_WIDTH + col) & 8'hFF;
+                end
+
+            end
+
+        end
+
+    endtask
+
+    task automatic calculate_expected;
+        integer accumulator;
+        integer pixel_value;
+        integer coefficient;
+        begin
+            for (int row = 0; row < OUTPUT_HEIGHT; row++) begin
+                for (int col = 0; col < OUTPUT_WIDTH; col++) begin
+                    accumulator = 0;
+                    for (int kr = 0; kr < 3; kr++) begin
+                        for (int kc = 0; kc < 3; kc++) begin
+                            pixel_value = image[(row + kr) * IMAGE_WIDTH + (col + kc)];
+                            coefficient = test_kernel[kr * 3 + kc];
+                            accumulator = accumulator + pixel_value * coefficient;
+                        end
+
+                    end
+
+                    if (accumulator > 32767) begin
+                        expected_output[row * OUTPUT_WIDTH + col] = 16'sh7FFF;
+                    end
+
+                    else if (accumulator < -32768) begin
+                        expected_output[row * OUTPUT_WIDTH + col] = 16'sh8000;
+                    end
+
+                    else begin
+                        expected_output[row * OUTPUT_WIDTH + col] = accumulator;
+                    end
+
+                end
+
+            end
+
+        end
+
+    endtask
+
+    task automatic stream_image;
+        begin
+            $display("");
+            $display("Starting image stream...");
+            @(negedge clk);
+            start = 1'b1;
+            @(negedge clk);
+            start = 1'b0;
+            wait (busy == 1'b1);
+            $display("Accelerator is running.");
+
+            for (int i = 0; i < TOTAL_INPUT_PIXELS; i++) begin
+                @(negedge clk);
+                pixel_valid = 1'b1;
+                pixel_in = image[i];
+
+            end
+            @(negedge clk);
+            pixel_valid = 1'b0;
+            pixel_in = 8'd0;
+            $display(
+                "Image stream complete: %0d pixels",
+                TOTAL_INPUT_PIXELS
+            );
+
+        end
+
+    endtask
+    always @(posedge clk) begin
+        if (output_valid) begin
+            #1;
+            if (output_count >= TOTAL_OUTPUT_PIXELS) begin
+                $display(
+                    "ERROR: Extra output detected: %0d",
+                    $signed(pixel_out)
+                );
+
+                errors++;
+
+            end
+
+            else begin
+
+                expected_row = output_count / OUTPUT_WIDTH;
+
+                expected_col = output_count % OUTPUT_WIDTH;
+
+                if (output_row !== expected_row) begin
+                    $display(
+                        "ERROR: output[%0d] ROW mismatch: expected=%0d actual=%0d",
+                        output_count,
+                        expected_row,
+                        output_row
+                    );
+                    errors++;
+                end
+
+                if (output_col !== expected_col) begin
+                    $display(
+                        "ERROR: output[%0d] COL mismatch: expected=%0d actual=%0d",
+                        output_count,
+                        expected_col,
+                        output_col
+                    );
+                    errors++;
+                end
+
+                if (pixel_out !== expected_output[output_count]) begin
+                    $display(
+                        "ERROR: output[%0d] VALUE mismatch: expected=%0d actual=%0d row=%0d col=%0d",
+                        output_count,
+                        $signed(expected_output[output_count]),
+                        $signed(pixel_out),
+                        output_row,
+                        output_col
+                    );
+                    errors++;
+                end
+                if (last_output_cycle != -1) begin
+                    if (current_cycle - last_output_cycle != 1) begin
+                        $display(
+                            "ERROR: OUTPUT BUBBLE: previous_cycle=%0d current_cycle=%0d",
+                            last_output_cycle,
+                            current_cycle
+                        );
+                        errors++;
+                    end
+                end
+                last_output_cycle = current_cycle;
+                if (pixel_out === expected_output[output_count]) begin
+                    $display(
+                        "PASS [%0d] row=%0d col=%0d value=%0d",
+                        output_count,
+                        output_row,
+                        output_col,
+                        $signed(pixel_out)
+                    );
+                end
+                output_count++;
+            end
+        end
+    end
+    initial begin
+        test_kernel[0] =  8'sd1;
+        test_kernel[1] =  8'sd0;
+        test_kernel[2] = -8'sd1;
+
+        test_kernel[3] =  8'sd1;
+        test_kernel[4] =  8'sd0;
+        test_kernel[5] = -8'sd1;
+
+        test_kernel[6] =  8'sd1;
+        test_kernel[7] =  8'sd0;
+        test_kernel[8] = -8'sd1;
+
+        reset_dut();
+
+        generate_image();
+
+        calculate_expected();
+
+        program_kernel();
+
+        relu_enable = 1'b0;
+
+        stream_image();
+
+        wait (done == 1'b1);
+
+        repeat (3) @(negedge clk);
+
+        if (output_count != TOTAL_OUTPUT_PIXELS) begin
+            $display(
+                "ERROR: Expected %0d outputs but received %0d",
+                TOTAL_OUTPUT_PIXELS,
+                output_count
+            );
+            errors++;
+        end
+
+        $display("");
+        $display("==============================================");
+        $display("              TEST SUMMARY");
+        $display("==============================================");
+        $display(
+            "Image size       : %0dx%0d",
+            IMAGE_WIDTH,
+            IMAGE_HEIGHT
+        );
+
+        $display(
+            "Kernel size      : %0dx%0d",
+            KERNEL_SIZE,
+            KERNEL_SIZE
+        );
+
+        $display(
+            "Expected outputs : %0d",
+            TOTAL_OUTPUT_PIXELS
+        );
+
+        $display(
+            "Actual outputs   : %0d",
+            output_count
+        );
+
+        $display(
+            "Errors           : %0d",
+            errors
+        );
+
+        if (errors == 0) begin
+            $display("");
+            $display("**************************************");
+            $display("            TEST PASSED");
+            $display("**************************************");
+        end
+
+        else begin
+            $display("");
+            $display("**************************************");
+            $display("            TEST FAILED");
+            $display("**************************************");
+        end
+
+        $display("==============================================");
+
+        $finish;
+
+    end
+
+endmodule
