@@ -1,98 +1,86 @@
 module window_generator #(
     parameter int IMAGE_WIDTH  = 32,
-    parameter int IMAGE_HEIGHT = 32
+    parameter int IMAGE_HEIGHT = 32,
+    parameter int KERNEL_SIZE  = 3
 )(
     input  logic clk,
     input  logic rst_n,
     input  logic       pixel_valid,
     input  logic [7:0] pixel_in,
-    output logic [7:0] window [0:2][0:2],
+    output logic [7:0] window [0:KERNEL_SIZE-1][0:KERNEL_SIZE-1],
     output logic       window_valid,
     output logic [$clog2(IMAGE_WIDTH)-1:0]  window_col,
     output logic [$clog2(IMAGE_HEIGHT)-1:0] window_row
 );
-    localparam int COL_WIDTH = (IMAGE_WIDTH <= 1) ? 1 : $clog2(IMAGE_WIDTH);
+    localparam int COL_WIDTH = (IMAGE_WIDTH  <= 1) ? 1 : $clog2(IMAGE_WIDTH);
     localparam int ROW_WIDTH = (IMAGE_HEIGHT <= 1) ? 1 : $clog2(IMAGE_HEIGHT);
+    // TAPS = number of shift-register slots needed per row lane
+    localparam int TAPS = KERNEL_SIZE - 1;
+
     logic [COL_WIDTH-1:0] current_col;
     logic [ROW_WIDTH-1:0] current_row;
-    logic [7:0] previous_row;
-    logic [7:0] two_rows_previous;
-    logic [7:0] top_shift_0;
-    logic [7:0] top_shift_1;
-    logic [7:0] middle_shift_0;
-    logic [7:0] middle_shift_1;
-    logic [7:0] bottom_shift_0;
-    logic [7:0] bottom_shift_1;
+
+    logic [7:0] prev_row [0:(KERNEL_SIZE > 1 ? KERNEL_SIZE-2 : 0)];
 
     line_buffer #(
-        .IMAGE_WIDTH(IMAGE_WIDTH)
+        .IMAGE_WIDTH (IMAGE_WIDTH),
+        .KERNEL_SIZE (KERNEL_SIZE)
     ) u_line_buffer (
         .clk(clk),
         .rst_n(rst_n),
         .write_en(pixel_valid),
         .column(current_col),
         .pixel_in(pixel_in),
-        .previous_row(previous_row),
-        .two_rows_previous(two_rows_previous)
+        .prev_row(prev_row)
     );
+
+    logic [7:0] row_input [0:KERNEL_SIZE-1];
+    always_comb begin
+        for (int r = 0; r < KERNEL_SIZE - 1; r++)
+            row_input[r] = prev_row[KERNEL_SIZE-2-r];
+        row_input[KERNEL_SIZE-1] = pixel_in;
+    end
+
+    logic [7:0] shift_reg [0:KERNEL_SIZE-1][0:(TAPS > 0 ? TAPS-1 : 0)];
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            current_col <= '0;
-            current_row <= '0;
-
-            window_col <= '0;
-            window_row <= '0;
-
-            top_shift_0 <= 0;
-            top_shift_1 <= 0;
-
-            middle_shift_0 <= 0;
-            middle_shift_1 <= 0;
-
-            bottom_shift_0 <= 0;
-            bottom_shift_1 <= 0;
-
+            current_col  <= '0;
+            current_row  <= '0;
+            window_col   <= '0;
+            window_row   <= '0;
             window_valid <= 1'b0;
-            for (int r = 0; r < 3; r++) begin
-                for (int c = 0; c < 3; c++) begin
+            for (int r = 0; r < KERNEL_SIZE; r++) begin
+                for (int c = 0; c < KERNEL_SIZE; c++)
                     window[r][c] <= 8'd0;
-                end
+                for (int t = 0; t < TAPS; t++)
+                    shift_reg[r][t] <= 8'd0;
             end
         end
         else begin
             window_valid <= 1'b0;
             if (pixel_valid) begin
-                if ((current_row >= 2) &&
-                    (current_col >= 2)) begin
+                if ((current_row >= KERNEL_SIZE-1) &&
+                    (current_col >= KERNEL_SIZE-1)) begin
 
-                    window[0][0] <= top_shift_0;
-                    window[0][1] <= top_shift_1;
-                    window[0][2] <= two_rows_previous;
+                    for (int r = 0; r < KERNEL_SIZE; r++) begin
+                        for (int c = 0; c < TAPS; c++)
+                            window[r][c] <= shift_reg[r][c];
+                        window[r][KERNEL_SIZE-1] <= row_input[r];
+                    end
 
-                    window[1][0] <= middle_shift_0;
-                    window[1][1] <= middle_shift_1;
-                    window[1][2] <= previous_row;
-
-                    window[2][0] <= bottom_shift_0;
-                    window[2][1] <= bottom_shift_1;
-                    window[2][2] <= pixel_in;
-
-                    window_col <= current_col - 2;
-                    window_row <= current_row - 2;
+                    window_col <= current_col - (KERNEL_SIZE-1);
+                    window_row <= current_row - (KERNEL_SIZE-1);
 
                     window_valid <= 1'b1;
-
                 end
 
-                top_shift_0 <= top_shift_1;
-                top_shift_1 <= two_rows_previous;
-
-                middle_shift_0 <= middle_shift_1;
-                middle_shift_1 <= previous_row;
-
-                bottom_shift_0 <= bottom_shift_1;
-                bottom_shift_1 <= pixel_in;
+                for (int r = 0; r < KERNEL_SIZE; r++) begin
+                    for (int c = 0; c < TAPS-1; c++)
+                        shift_reg[r][c] <= shift_reg[r][c+1];
+                    if (TAPS > 0)
+                        shift_reg[r][TAPS-1] <= row_input[r];
+                end
 
                 if (current_col == IMAGE_WIDTH-1) begin
                     current_col <= 0;
@@ -101,15 +89,11 @@ module window_generator #(
                     else
                         current_row <= current_row + 1'b1;
                 end
-
                 else begin
                     current_col <= current_col + 1'b1;
                 end
-
             end
-
         end
-
     end
 
 endmodule
