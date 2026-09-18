@@ -3,7 +3,9 @@
 module cnn_accelerator_tb;
     localparam int IMAGE_WIDTH  = 32;
     localparam int IMAGE_HEIGHT = 32;
-    localparam int KERNEL_SIZE = 3;
+    localparam int KERNEL_SIZE  = 3;
+    localparam int NUM_TAPS     = KERNEL_SIZE * KERNEL_SIZE;
+    localparam int KADDR_WIDTH  = (NUM_TAPS <= 1) ? 1 : $clog2(NUM_TAPS);
     localparam int OUTPUT_WIDTH = IMAGE_WIDTH - KERNEL_SIZE + 1;
     localparam int OUTPUT_HEIGHT = IMAGE_HEIGHT - KERNEL_SIZE + 1;
     localparam int TOTAL_INPUT_PIXELS = IMAGE_WIDTH * IMAGE_HEIGHT;
@@ -15,16 +17,16 @@ module cnn_accelerator_tb;
     logic done;
     logic       pixel_valid;
     logic [7:0] pixel_in;
-    logic              kernel_we;
-    logic [3:0]        kernel_addr;
-    logic signed [7:0] kernel_data;
+    logic                      kernel_we;
+    logic [KADDR_WIDTH-1:0]    kernel_addr;
+    logic signed [7:0]         kernel_data;
     logic relu_enable;
     logic               output_valid;
     logic signed [15:0] pixel_out;
     logic [$clog2(IMAGE_WIDTH)-1:0]  output_col;
     logic [$clog2(IMAGE_HEIGHT)-1:0] output_row;
     logic [7:0] image [0:TOTAL_INPUT_PIXELS-1];
-    logic signed [7:0] test_kernel [0:8];
+    logic signed [7:0] test_kernel [0:NUM_TAPS-1];
     logic signed [15:0] expected_output [0:TOTAL_OUTPUT_PIXELS-1];
     integer errors;
     integer output_count;
@@ -34,7 +36,8 @@ module cnn_accelerator_tb;
     integer last_output_cycle;
     cnn_accelerator #(
         .IMAGE_WIDTH  (IMAGE_WIDTH),
-        .IMAGE_HEIGHT (IMAGE_HEIGHT)
+        .IMAGE_HEIGHT (IMAGE_HEIGHT),
+        .KERNEL_SIZE  (KERNEL_SIZE)
     ) dut (
         .clk(clk),
         .rst_n(rst_n),
@@ -77,7 +80,7 @@ module cnn_accelerator_tb;
             pixel_valid = 1'b0;
             pixel_in = 8'd0;
             kernel_we = 1'b0;
-            kernel_addr = 4'd0;
+            kernel_addr = '0;
             kernel_data = 8'sd0;
             relu_enable = 1'b0;
             repeat (5) @(negedge clk);
@@ -97,12 +100,12 @@ module cnn_accelerator_tb;
         begin
             @(negedge clk);
             kernel_we   = 1'b1;
-            kernel_addr = address;
+            kernel_addr = address[KADDR_WIDTH-1:0];
             kernel_data = value;
 
             @(negedge clk);
             kernel_we   = 1'b0;
-            kernel_addr = 4'd0;
+            kernel_addr = '0;
             kernel_data = 8'sd0;
 
         end
@@ -113,7 +116,7 @@ module cnn_accelerator_tb;
         begin
             $display("");
             $display("Programming kernel...");
-            for (int i = 0; i < 9; i++) begin
+            for (int i = 0; i < NUM_TAPS; i++) begin
                 write_kernel(
                     i,
                     test_kernel[i]
@@ -145,10 +148,10 @@ module cnn_accelerator_tb;
             for (int row = 0; row < OUTPUT_HEIGHT; row++) begin
                 for (int col = 0; col < OUTPUT_WIDTH; col++) begin
                     accumulator = 0;
-                    for (int kr = 0; kr < 3; kr++) begin
-                        for (int kc = 0; kc < 3; kc++) begin
+                    for (int kr = 0; kr < KERNEL_SIZE; kr++) begin
+                        for (int kc = 0; kc < KERNEL_SIZE; kc++) begin
                             pixel_value = image[(row + kr) * IMAGE_WIDTH + (col + kc)];
-                            coefficient = test_kernel[kr * 3 + kc];
+                            coefficient = test_kernel[kr * KERNEL_SIZE + kc];
                             accumulator = accumulator + pixel_value * coefficient;
                         end
 
@@ -203,8 +206,8 @@ module cnn_accelerator_tb;
 
     endtask
     always @(posedge clk) begin
+        #1;
         if (output_valid) begin
-            #1;
             if (output_count >= TOTAL_OUTPUT_PIXELS) begin
                 $display(
                     "ERROR: Extra output detected: %0d",
@@ -277,6 +280,9 @@ module cnn_accelerator_tb;
         end
     end
     initial begin
+        // Default 3x3 test kernel
+        // If you change KERNEL_SIZE above, replace this block with
+        // NUM_TAPS worth of coefficients.
         test_kernel[0] =  8'sd1;
         test_kernel[1] =  8'sd0;
         test_kernel[2] = -8'sd1;

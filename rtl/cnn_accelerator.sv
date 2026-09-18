@@ -1,6 +1,9 @@
 module cnn_accelerator #(
-    parameter int IMAGE_WIDTH  = 32,
-    parameter int IMAGE_HEIGHT = 32
+    parameter  int IMAGE_WIDTH   = 32,
+    parameter  int IMAGE_HEIGHT  = 32,
+    parameter  int KERNEL_SIZE   = 3,
+    localparam int NUM_TAPS      = KERNEL_SIZE * KERNEL_SIZE,
+    localparam int KADDR_WIDTH   = (NUM_TAPS <= 1) ? 1 : $clog2(NUM_TAPS)
 )(
     input  logic clk,
     input  logic rst_n,
@@ -9,9 +12,9 @@ module cnn_accelerator #(
     output logic done,
     input logic       pixel_valid,
     input logic [7:0] pixel_in,
-    input logic              kernel_we,
-    input logic [3:0]        kernel_addr,
-    input logic signed [7:0] kernel_data,
+    input logic                                 kernel_we,
+    input logic [KADDR_WIDTH-1:0]               kernel_addr,
+    input logic signed [7:0]                    kernel_data,
     input logic relu_enable,
     output logic output_valid,
     output logic signed [15:0] pixel_out,
@@ -19,7 +22,6 @@ module cnn_accelerator #(
     output logic [$clog2(IMAGE_HEIGHT)-1:0] output_row
 );
 
-    localparam int KERNEL_SIZE = 3;
     localparam int OUTPUT_WIDTH = IMAGE_WIDTH - KERNEL_SIZE + 1;
     localparam int OUTPUT_HEIGHT = IMAGE_HEIGHT - KERNEL_SIZE + 1;
     localparam int TOTAL_INPUT_PIXELS = IMAGE_WIDTH * IMAGE_HEIGHT;
@@ -31,7 +33,9 @@ module cnn_accelerator #(
     localparam int FIFO_DEPTH      = 64;
     localparam int FIFO_ADDR_WIDTH = 6;
     localparam int FIFO_DATA_WIDTH = 16 + COL_WIDTH + ROW_WIDTH;
-    localparam int FIFO_PREFILL    = 60;
+    localparam int FIFO_PREFILL    = (TOTAL_OUTPUT_PIXELS < 60) ? TOTAL_OUTPUT_PIXELS : 60;
+    localparam int ADDER_STAGES = (NUM_TAPS <= 1) ? 0 : $clog2(NUM_TAPS);
+    localparam int PIPE_DELAY   = ADDER_STAGES + 1;
 
     typedef enum logic [2:0] {
         S_IDLE,
@@ -43,14 +47,15 @@ module cnn_accelerator #(
     state_t state;
     logic [INPUT_COUNT_WIDTH-1:0] input_count;
     logic [OUTPUT_COUNT_WIDTH-1:0] output_count;
-    logic [7:0] window [0:2][0:2];
+    logic [7:0] window [0:KERNEL_SIZE-1][0:KERNEL_SIZE-1];
     logic window_valid;
     logic [COL_WIDTH-1:0] window_col;
     logic [ROW_WIDTH-1:0] window_row;
 
     window_generator #(
         .IMAGE_WIDTH  (IMAGE_WIDTH),
-        .IMAGE_HEIGHT (IMAGE_HEIGHT)
+        .IMAGE_HEIGHT (IMAGE_HEIGHT),
+        .KERNEL_SIZE  (KERNEL_SIZE)
     ) u_window_generator (
         .clk(clk),
         .rst_n(rst_n),
@@ -64,8 +69,10 @@ module cnn_accelerator #(
         .window_row(window_row)
     );
 
-    logic signed [7:0] kernel [0:8];
-    kernel_memory u_kernel_memory (
+    logic signed [7:0] kernel [0:NUM_TAPS-1];
+    kernel_memory #(
+        .KERNEL_SIZE (KERNEL_SIZE)
+    ) u_kernel_memory (
         .clk(clk),
         .rst_n(rst_n),
         .kernel_we(
@@ -75,29 +82,30 @@ module cnn_accelerator #(
         .kernel_data(kernel_data),
         .kernel(kernel)
     );
-    logic [7:0] window_flat [0:8];
+
+    logic [7:0] window_flat [0:NUM_TAPS-1];
     always_comb begin
-        window_flat[0] = window[0][0];
-        window_flat[1] = window[0][1];
-        window_flat[2] = window[0][2];
-
-        window_flat[3] = window[1][0];
-        window_flat[4] = window[1][1];
-        window_flat[5] = window[1][2];
-
-        window_flat[6] = window[2][0];
-        window_flat[7] = window[2][1];
-        window_flat[8] = window[2][2];
+        for (int r = 0; r < KERNEL_SIZE; r++)
+            for (int c = 0; c < KERNEL_SIZE; c++)
+                window_flat[r*KERNEL_SIZE + c] = window[r][c];
     end
-    logic signed [15:0] product [0:8];
-    mac_array u_mac_array (
+
+    logic signed [15:0] product [0:NUM_TAPS-1];
+    mac_array #(
+        .NUM_TAPS (NUM_TAPS)
+    ) u_mac_array (
         .pixel(window_flat),
         .kernel(kernel),
         .product(product)
     );
+
     logic signed [31:0] accumulator;
     logic accumulator_valid;
-    adder_tree u_adder_tree (
+    adder_tree #(
+        .NUM_INPUTS (NUM_TAPS),
+        .IN_WIDTH   (16),
+        .OUT_WIDTH  (32)
+    ) u_adder_tree (
         .clk(clk),
         .rst_n(rst_n),
         .valid_in(window_valid),
@@ -105,6 +113,7 @@ module cnn_accelerator #(
         .valid_out(accumulator_valid),
         .sum_out(accumulator)
     );
+
     logic                post_process_valid;
     logic signed [15:0]  post_process_data;
     post_process u_post_process (
@@ -116,11 +125,12 @@ module cnn_accelerator #(
         .valid_out(post_process_valid),
         .output_data(post_process_data)
     );
-    logic [COL_WIDTH-1:0] col_pipe [0:4];
-    logic [ROW_WIDTH-1:0] row_pipe [0:4];
+
+    logic [COL_WIDTH-1:0] col_pipe [0:PIPE_DELAY-1];
+    logic [ROW_WIDTH-1:0] row_pipe [0:PIPE_DELAY-1];
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            for (int i = 0; i < 5; i++) begin
+            for (int i = 0; i < PIPE_DELAY; i++) begin
                 col_pipe[i] <= '0;
                 row_pipe[i] <= '0;
             end
@@ -131,22 +141,17 @@ module cnn_accelerator #(
                 row_pipe[0] <= window_row;
             end
 
-            col_pipe[1] <= col_pipe[0];
-            col_pipe[2] <= col_pipe[1];
-            col_pipe[3] <= col_pipe[2];
-            col_pipe[4] <= col_pipe[3];
-
-            row_pipe[1] <= row_pipe[0];
-            row_pipe[2] <= row_pipe[1];
-            row_pipe[3] <= row_pipe[2];
-            row_pipe[4] <= row_pipe[3];
+            for (int i = 1; i < PIPE_DELAY; i++) begin
+                col_pipe[i] <= col_pipe[i-1];
+                row_pipe[i] <= row_pipe[i-1];
+            end
         end
     end
     logic [COL_WIDTH-1:0] pipe_col;
     logic [ROW_WIDTH-1:0] pipe_row;
 
-    assign pipe_col = col_pipe[4];
-    assign pipe_row = row_pipe[4];
+    assign pipe_col = col_pipe[PIPE_DELAY-1];
+    assign pipe_row = row_pipe[PIPE_DELAY-1];
 
     logic [FIFO_DATA_WIDTH-1:0] fifo_write_data;
     logic [FIFO_DATA_WIDTH-1:0] fifo_read_data;
@@ -210,11 +215,6 @@ module cnn_accelerator #(
                 pixel_out_reg  <= $signed(fifo_read_data[15:0]);
                 output_col_reg <= fifo_read_data[16 +: COL_WIDTH];
                 output_row_reg <= fifo_read_data[(16 + COL_WIDTH) +: ROW_WIDTH];
-            end
-
-            else if (output_valid_reg && fifo_empty) begin
-                output_col_reg <= OUTPUT_WIDTH - 1;
-                output_row_reg <= OUTPUT_HEIGHT - 1;
             end
         end
     end
