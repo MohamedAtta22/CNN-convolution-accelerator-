@@ -4,8 +4,10 @@ module cnn_accelerator_tb;
     localparam int IMAGE_WIDTH  = 32;
     localparam int IMAGE_HEIGHT = 32;
     localparam int KERNEL_SIZE  = 3;
+    localparam int NUM_KERNELS  = 2;
     localparam int NUM_TAPS     = KERNEL_SIZE * KERNEL_SIZE;
     localparam int KADDR_WIDTH  = (NUM_TAPS <= 1) ? 1 : $clog2(NUM_TAPS);
+    localparam int KSEL_WIDTH   = (NUM_KERNELS <= 1) ? 1 : $clog2(NUM_KERNELS);
     localparam int OUTPUT_WIDTH = IMAGE_WIDTH - KERNEL_SIZE + 1;
     localparam int OUTPUT_HEIGHT = IMAGE_HEIGHT - KERNEL_SIZE + 1;
     localparam int TOTAL_INPUT_PIXELS = IMAGE_WIDTH * IMAGE_HEIGHT;
@@ -18,16 +20,17 @@ module cnn_accelerator_tb;
     logic       pixel_valid;
     logic [7:0] pixel_in;
     logic                      kernel_we;
+    logic [KSEL_WIDTH-1:0]     kernel_sel;
     logic [KADDR_WIDTH-1:0]    kernel_addr;
     logic signed [7:0]         kernel_data;
     logic relu_enable;
     logic               output_valid;
-    logic signed [15:0] pixel_out;
+    logic signed [15:0] pixel_out [0:NUM_KERNELS-1];
     logic [$clog2(IMAGE_WIDTH)-1:0]  output_col;
     logic [$clog2(IMAGE_HEIGHT)-1:0] output_row;
     logic [7:0] image [0:TOTAL_INPUT_PIXELS-1];
-    logic signed [7:0] test_kernel [0:NUM_TAPS-1];
-    logic signed [15:0] expected_output [0:TOTAL_OUTPUT_PIXELS-1];
+    logic signed [7:0] test_kernel [0:NUM_KERNELS-1][0:NUM_TAPS-1];
+    logic signed [15:0] expected_output [0:NUM_KERNELS-1][0:TOTAL_OUTPUT_PIXELS-1];
     integer errors;
     integer output_count;
     integer expected_row;
@@ -37,7 +40,8 @@ module cnn_accelerator_tb;
     cnn_accelerator #(
         .IMAGE_WIDTH  (IMAGE_WIDTH),
         .IMAGE_HEIGHT (IMAGE_HEIGHT),
-        .KERNEL_SIZE  (KERNEL_SIZE)
+        .KERNEL_SIZE  (KERNEL_SIZE),
+        .NUM_KERNELS  (NUM_KERNELS)
     ) dut (
         .clk(clk),
         .rst_n(rst_n),
@@ -47,6 +51,7 @@ module cnn_accelerator_tb;
         .pixel_valid(pixel_valid),
         .pixel_in(pixel_in),
         .kernel_we(kernel_we),
+        .kernel_sel(kernel_sel),
         .kernel_addr(kernel_addr),
         .kernel_data(kernel_data),
         .relu_enable(relu_enable),
@@ -80,6 +85,7 @@ module cnn_accelerator_tb;
             pixel_valid = 1'b0;
             pixel_in = 8'd0;
             kernel_we = 1'b0;
+            kernel_sel = '0;
             kernel_addr = '0;
             kernel_data = 8'sd0;
             relu_enable = 1'b0;
@@ -94,17 +100,20 @@ module cnn_accelerator_tb;
     endtask
 
     task automatic write_kernel(
+        input integer sel,
         input integer address,
         input integer value
     );
         begin
             @(negedge clk);
             kernel_we   = 1'b1;
+            kernel_sel  = sel[KSEL_WIDTH-1:0];
             kernel_addr = address[KADDR_WIDTH-1:0];
             kernel_data = value;
 
             @(negedge clk);
             kernel_we   = 1'b0;
+            kernel_sel  = '0;
             kernel_addr = '0;
             kernel_data = 8'sd0;
 
@@ -115,14 +124,17 @@ module cnn_accelerator_tb;
     task automatic program_kernel;
         begin
             $display("");
-            $display("Programming kernel...");
-            for (int i = 0; i < NUM_TAPS; i++) begin
-                write_kernel(
-                    i,
-                    test_kernel[i]
-                );
+            $display("Programming %0d kernel bank(s)...", NUM_KERNELS);
+            for (int k = 0; k < NUM_KERNELS; k++) begin
+                for (int i = 0; i < NUM_TAPS; i++) begin
+                    write_kernel(
+                        k,
+                        i,
+                        test_kernel[k][i]
+                    );
+                end
             end
-            $display("Kernel programmed.");
+            $display("Kernel(s) programmed.");
         end
 
     endtask
@@ -145,32 +157,34 @@ module cnn_accelerator_tb;
         integer pixel_value;
         integer coefficient;
         begin
-            for (int row = 0; row < OUTPUT_HEIGHT; row++) begin
-                for (int col = 0; col < OUTPUT_WIDTH; col++) begin
-                    accumulator = 0;
-                    for (int kr = 0; kr < KERNEL_SIZE; kr++) begin
-                        for (int kc = 0; kc < KERNEL_SIZE; kc++) begin
-                            pixel_value = image[(row + kr) * IMAGE_WIDTH + (col + kc)];
-                            coefficient = test_kernel[kr * KERNEL_SIZE + kc];
-                            accumulator = accumulator + pixel_value * coefficient;
+            for (int k = 0; k < NUM_KERNELS; k++) begin
+                for (int row = 0; row < OUTPUT_HEIGHT; row++) begin
+                    for (int col = 0; col < OUTPUT_WIDTH; col++) begin
+                        accumulator = 0;
+                        for (int kr = 0; kr < KERNEL_SIZE; kr++) begin
+                            for (int kc = 0; kc < KERNEL_SIZE; kc++) begin
+                                pixel_value = image[(row + kr) * IMAGE_WIDTH + (col + kc)];
+                                coefficient = test_kernel[k][kr * KERNEL_SIZE + kc];
+                                accumulator = accumulator + pixel_value * coefficient;
+                            end
+
+                        end
+
+                        if (accumulator > 32767) begin
+                            expected_output[k][row * OUTPUT_WIDTH + col] = 16'sh7FFF;
+                        end
+
+                        else if (accumulator < -32768) begin
+                            expected_output[k][row * OUTPUT_WIDTH + col] = 16'sh8000;
+                        end
+
+                        else begin
+                            expected_output[k][row * OUTPUT_WIDTH + col] = accumulator;
                         end
 
                     end
 
-                    if (accumulator > 32767) begin
-                        expected_output[row * OUTPUT_WIDTH + col] = 16'sh7FFF;
-                    end
-
-                    else if (accumulator < -32768) begin
-                        expected_output[row * OUTPUT_WIDTH + col] = 16'sh8000;
-                    end
-
-                    else begin
-                        expected_output[row * OUTPUT_WIDTH + col] = accumulator;
-                    end
-
                 end
-
             end
 
         end
@@ -210,8 +224,8 @@ module cnn_accelerator_tb;
         if (output_valid) begin
             if (output_count >= TOTAL_OUTPUT_PIXELS) begin
                 $display(
-                    "ERROR: Extra output detected: %0d",
-                    $signed(pixel_out)
+                    "ERROR: Extra output detected at bank 0: %0d",
+                    $signed(pixel_out[0])
                 );
 
                 errors++;
@@ -244,16 +258,29 @@ module cnn_accelerator_tb;
                     errors++;
                 end
 
-                if (pixel_out !== expected_output[output_count]) begin
-                    $display(
-                        "ERROR: output[%0d] VALUE mismatch: expected=%0d actual=%0d row=%0d col=%0d",
-                        output_count,
-                        $signed(expected_output[output_count]),
-                        $signed(pixel_out),
-                        output_row,
-                        output_col
-                    );
-                    errors++;
+                for (int k = 0; k < NUM_KERNELS; k++) begin
+                    if ($isunknown(pixel_out[k]) || (pixel_out[k] !== expected_output[k][output_count])) begin
+                        $display(
+                            "ERROR: output[%0d] bank=%0d VALUE mismatch: expected=%0d actual=%0d row=%0d col=%0d",
+                            output_count,
+                            k,
+                            $signed(expected_output[k][output_count]),
+                            $signed(pixel_out[k]),
+                            output_row,
+                            output_col
+                        );
+                        errors++;
+                    end
+                    else begin
+                        $display(
+                            "PASS  [%0d] bank=%0d row=%0d col=%0d value=%0d",
+                            output_count,
+                            k,
+                            output_row,
+                            output_col,
+                            $signed(pixel_out[k])
+                        );
+                    end
                 end
                 if (last_output_cycle != -1) begin
                     if (current_cycle - last_output_cycle != 1) begin
@@ -266,34 +293,22 @@ module cnn_accelerator_tb;
                     end
                 end
                 last_output_cycle = current_cycle;
-                if (pixel_out === expected_output[output_count]) begin
-                    $display(
-                        "PASS [%0d] row=%0d col=%0d value=%0d",
-                        output_count,
-                        output_row,
-                        output_col,
-                        $signed(pixel_out)
-                    );
-                end
                 output_count++;
             end
         end
     end
     initial begin
-        // Default 3x3 test kernel
-        // If you change KERNEL_SIZE above, replace this block with
-        // NUM_TAPS worth of coefficients.
-        test_kernel[0] =  8'sd1;
-        test_kernel[1] =  8'sd0;
-        test_kernel[2] = -8'sd1;
+        // Bank 0: horizontal edge-detect
+        // Bank 1: a distinct all-positive averaging-style kernel,
+        // so a channel-swap or cross-talk bug between banks would
+        // show up as a VALUE mismatch instead of silently passing.
+        test_kernel[0][0] =  8'sd1;  test_kernel[0][1] =  8'sd0;  test_kernel[0][2] = -8'sd1;
+        test_kernel[0][3] =  8'sd1;  test_kernel[0][4] =  8'sd0;  test_kernel[0][5] = -8'sd1;
+        test_kernel[0][6] =  8'sd1;  test_kernel[0][7] =  8'sd0;  test_kernel[0][8] = -8'sd1;
 
-        test_kernel[3] =  8'sd1;
-        test_kernel[4] =  8'sd0;
-        test_kernel[5] = -8'sd1;
-
-        test_kernel[6] =  8'sd1;
-        test_kernel[7] =  8'sd0;
-        test_kernel[8] = -8'sd1;
+        test_kernel[1][0] =  8'sd1;  test_kernel[1][1] =  8'sd2;  test_kernel[1][2] =  8'sd1;
+        test_kernel[1][3] =  8'sd2;  test_kernel[1][4] =  8'sd4;  test_kernel[1][5] =  8'sd2;
+        test_kernel[1][6] =  8'sd1;  test_kernel[1][7] =  8'sd2;  test_kernel[1][8] =  8'sd1;
 
         reset_dut();
 
@@ -337,8 +352,14 @@ module cnn_accelerator_tb;
         );
 
         $display(
-            "Expected outputs : %0d",
-            TOTAL_OUTPUT_PIXELS
+            "Kernel banks     : %0d",
+            NUM_KERNELS
+        );
+
+        $display(
+            "Expected outputs : %0d (x%0d banks)",
+            TOTAL_OUTPUT_PIXELS,
+            NUM_KERNELS
         );
 
         $display(
