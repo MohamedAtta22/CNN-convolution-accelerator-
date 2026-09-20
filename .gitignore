@@ -1,3 +1,9 @@
 work*
 *.vcd
 transcript*
+/.venv
+/.Xil
+/synth_out
+/vectors
+*logfile
+*.wlf
