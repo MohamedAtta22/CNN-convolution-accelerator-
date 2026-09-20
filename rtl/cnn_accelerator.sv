@@ -2,8 +2,10 @@ module cnn_accelerator #(
     parameter  int IMAGE_WIDTH   = 32,
     parameter  int IMAGE_HEIGHT  = 32,
     parameter  int KERNEL_SIZE   = 3,
+    parameter  int NUM_KERNELS   = 1,
     localparam int NUM_TAPS      = KERNEL_SIZE * KERNEL_SIZE,
-    localparam int KADDR_WIDTH   = (NUM_TAPS <= 1) ? 1 : $clog2(NUM_TAPS)
+    localparam int KADDR_WIDTH   = (NUM_TAPS <= 1) ? 1 : $clog2(NUM_TAPS),
+    localparam int KSEL_WIDTH    = (NUM_KERNELS <= 1) ? 1 : $clog2(NUM_KERNELS)
 )(
     input  logic clk,
     input  logic rst_n,
@@ -13,11 +15,12 @@ module cnn_accelerator #(
     input logic       pixel_valid,
     input logic [7:0] pixel_in,
     input logic                                 kernel_we,
+    input logic [KSEL_WIDTH-1:0]                kernel_sel,
     input logic [KADDR_WIDTH-1:0]               kernel_addr,
     input logic signed [7:0]                    kernel_data,
     input logic relu_enable,
     output logic output_valid,
-    output logic signed [15:0] pixel_out,
+    output logic signed [15:0] pixel_out [0:NUM_KERNELS-1],
     output logic [$clog2(IMAGE_WIDTH)-1:0]  output_col,
     output logic [$clog2(IMAGE_HEIGHT)-1:0] output_row
 );
@@ -32,7 +35,8 @@ module cnn_accelerator #(
     localparam int OUTPUT_COUNT_WIDTH = (TOTAL_OUTPUT_PIXELS <= 1) ? 1 : $clog2(TOTAL_OUTPUT_PIXELS + 1);
     localparam int FIFO_DEPTH      = 64;
     localparam int FIFO_ADDR_WIDTH = 6;
-    localparam int FIFO_DATA_WIDTH = 16 + COL_WIDTH + ROW_WIDTH;
+    localparam int PIXEL_BITS      = 16 * NUM_KERNELS;
+    localparam int FIFO_DATA_WIDTH = PIXEL_BITS + COL_WIDTH + ROW_WIDTH;
     localparam int FIFO_PREFILL    = (TOTAL_OUTPUT_PIXELS < 60) ? TOTAL_OUTPUT_PIXELS : 60;
     localparam int ADDER_STAGES = (NUM_TAPS <= 1) ? 0 : $clog2(NUM_TAPS);
     localparam int PIPE_DELAY   = ADDER_STAGES + 1;
@@ -69,15 +73,17 @@ module cnn_accelerator #(
         .window_row(window_row)
     );
 
-    logic signed [7:0] kernel [0:NUM_TAPS-1];
+    logic signed [7:0] kernel [0:NUM_KERNELS-1][0:NUM_TAPS-1];
     kernel_memory #(
-        .KERNEL_SIZE (KERNEL_SIZE)
+        .KERNEL_SIZE (KERNEL_SIZE),
+        .NUM_KERNELS (NUM_KERNELS)
     ) u_kernel_memory (
         .clk(clk),
         .rst_n(rst_n),
         .kernel_we(
             kernel_we && (state == S_IDLE)
         ),
+        .kernel_sel(kernel_sel),
         .kernel_addr(kernel_addr),
         .kernel_data(kernel_data),
         .kernel(kernel)
@@ -90,41 +96,54 @@ module cnn_accelerator #(
                 window_flat[r*KERNEL_SIZE + c] = window[r][c];
     end
 
-    logic signed [15:0] product [0:NUM_TAPS-1];
-    mac_array #(
-        .NUM_TAPS (NUM_TAPS)
-    ) u_mac_array (
-        .pixel(window_flat),
-        .kernel(kernel),
-        .product(product)
-    );
+    logic signed [31:0] accumulator [0:NUM_KERNELS-1];
+    logic                accumulator_valid [0:NUM_KERNELS-1];
+    logic                post_process_valid [0:NUM_KERNELS-1];
+    logic signed [15:0]  post_process_data [0:NUM_KERNELS-1];
 
-    logic signed [31:0] accumulator;
-    logic accumulator_valid;
-    adder_tree #(
-        .NUM_INPUTS (NUM_TAPS),
-        .IN_WIDTH   (16),
-        .OUT_WIDTH  (32)
-    ) u_adder_tree (
-        .clk(clk),
-        .rst_n(rst_n),
-        .valid_in(window_valid),
-        .product(product),
-        .valid_out(accumulator_valid),
-        .sum_out(accumulator)
-    );
+    genvar k;
+    generate
+        for (k = 0; k < NUM_KERNELS; k++) begin : KCH
+            logic signed [7:0]  kernel_bank  [0:NUM_TAPS-1];
+            logic signed [15:0] product_bank [0:NUM_TAPS-1];
 
-    logic                post_process_valid;
-    logic signed [15:0]  post_process_data;
-    post_process u_post_process (
-        .clk(clk),
-        .rst_n(rst_n),
-        .valid_in(accumulator_valid),
-        .accumulator(accumulator),
-        .relu_enable(relu_enable),
-        .valid_out(post_process_valid),
-        .output_data(post_process_data)
-    );
+            always_comb begin
+                for (int t = 0; t < NUM_TAPS; t++)
+                    kernel_bank[t] = kernel[k][t];
+            end
+
+            mac_array #(
+                .NUM_TAPS (NUM_TAPS)
+            ) u_mac_array (
+                .pixel(window_flat),
+                .kernel(kernel_bank),
+                .product(product_bank)
+            );
+
+            adder_tree #(
+                .NUM_INPUTS (NUM_TAPS),
+                .IN_WIDTH   (16),
+                .OUT_WIDTH  (32)
+            ) u_adder_tree (
+                .clk(clk),
+                .rst_n(rst_n),
+                .valid_in(window_valid),
+                .product(product_bank),
+                .valid_out(accumulator_valid[k]),
+                .sum_out(accumulator[k])
+            );
+
+            post_process u_post_process (
+                .clk(clk),
+                .rst_n(rst_n),
+                .valid_in(accumulator_valid[k]),
+                .accumulator(accumulator[k]),
+                .relu_enable(relu_enable),
+                .valid_out(post_process_valid[k]),
+                .output_data(post_process_data[k])
+            );
+        end
+    endgenerate
 
     logic [COL_WIDTH-1:0] col_pipe [0:PIPE_DELAY-1];
     logic [ROW_WIDTH-1:0] row_pipe [0:PIPE_DELAY-1];
@@ -161,10 +180,16 @@ module cnn_accelerator #(
     logic                       fifo_read_en;
     logic                       fifo_started;
 
+    logic [PIXEL_BITS-1:0] fifo_pixel_bits;
+    always_comb begin
+        for (int kk = 0; kk < NUM_KERNELS; kk++)
+            fifo_pixel_bits[kk*16 +: 16] = post_process_data[kk];
+    end
+
     assign fifo_write_data = {
         pipe_row,
         pipe_col,
-        post_process_data
+        fifo_pixel_bits
     };
 
     output_fifo #(
@@ -174,7 +199,7 @@ module cnn_accelerator #(
     ) u_output_fifo (
         .clk(clk),
         .rst_n(rst_n),
-        .write_en(post_process_valid),
+        .write_en(post_process_valid[0]),
         .write_data(fifo_write_data),
         .read_en(fifo_read_en),
         .read_data(fifo_read_data),
@@ -198,23 +223,25 @@ module cnn_accelerator #(
     assign fifo_read_en = fifo_started && !fifo_empty;
 
     logic                       output_valid_reg;
-    logic signed [15:0]         pixel_out_reg;
+    logic signed [15:0]         pixel_out_reg [0:NUM_KERNELS-1];
     logic [COL_WIDTH-1:0]       output_col_reg;
     logic [ROW_WIDTH-1:0]       output_row_reg;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             output_valid_reg <= 1'b0;
-            pixel_out_reg    <= '0;
             output_col_reg   <= '0;
             output_row_reg   <= '0;
+            for (int kk = 0; kk < NUM_KERNELS; kk++)
+                pixel_out_reg[kk] <= '0;
         end
         else begin
             output_valid_reg <= fifo_read_en;
             if (fifo_read_en) begin
-                pixel_out_reg  <= $signed(fifo_read_data[15:0]);
-                output_col_reg <= fifo_read_data[16 +: COL_WIDTH];
-                output_row_reg <= fifo_read_data[(16 + COL_WIDTH) +: ROW_WIDTH];
+                for (int kk = 0; kk < NUM_KERNELS; kk++)
+                    pixel_out_reg[kk] <= $signed(fifo_read_data[kk*16 +: 16]);
+                output_col_reg <= fifo_read_data[PIXEL_BITS +: COL_WIDTH];
+                output_row_reg <= fifo_read_data[(PIXEL_BITS + COL_WIDTH) +: ROW_WIDTH];
             end
         end
     end
